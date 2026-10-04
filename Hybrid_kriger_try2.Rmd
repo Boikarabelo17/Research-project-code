@@ -1,0 +1,2185 @@
+---
+title: "Hybrid kriging try"
+author: "BOIKARABELO OLIFANT"
+date: "2026-08-20"
+output: pdf_document
+---
+
+
+
+
+```{r}
+
+
+library(caret)
+library(sf)
+library(ggplot2)
+
+
+airbnb <- readRDS("C:/Users/boika/Downloads/California_airbnb.csv/California_airbnb.rds") 
+#head(airbnb)
+
+# Drop redundant textual indices and high-missing-ratio variables
+airbnb1 <- unique(airbnb)
+airbnb2 <- airbnb1[, setdiff(names(airbnb1), c("scrape_id", "host_id", "name", "host_country", "bedrooms"))]
+
+
+```
+## id_scape, name, host_country must be removed since they serve little purpose.
+## bedrooms column removed since it has too many missing values.
+
+
+
+
+## The "Date" columns next
+
+```{r}
+
+library(lubridate)
+
+# Breakpoint for restarts
+bnb <- airbnb2
+
+date_cols <- c("first_review", "last_review", "host_since", "calendar_last_scraped", "Date") 
+
+# Process, create numeric features, and drop original raw dimensions
+for (col in date_cols) {
+  new_num_name <- paste0(col, "_num")
+  
+  # Convert calendar timestamps to continuous day counts since Unix epoch
+  bnb[[new_num_name]] <- as.numeric(ymd(bnb[[col]]))
+  
+  # Delete original text timestamp fields
+  bnb[[col]] <- NULL
+}
+
+str(bnb$Date_num)
+
+
+
+```
+
+
+
+
+## Prep for preprocessing after spliting.
+## handling the missing values in the review scores.
+```{r}
+
+score_cols <- c(
+  "review_scores_rating", "review_scores_accuracy", "review_scores_cleanliness",
+  "review_scores_checkin", "review_scores_communication", "review_scores_location", 
+  "review_scores_value", "reviews_per_month"
+)
+
+# Create missing listings tracker column indicator flag
+bnb$is_new_listing <- as.integer(is.na(bnb$review_scores_rating))
+
+
+
+
+```
+
+
+```{r}
+
+# Split data (70/30)
+
+set.seed(1852) 
+train_idx  <- sample(1:nrow(bnb), 0.7 * nrow(bnb))
+train_data <- bnb[train_idx, ]
+test_data  <- bnb[-train_idx, ]
+
+# Filter zero/near-zero variance predictors across the partitions
+remove_tcols <- nearZeroVar(train_data, names = TRUE)
+
+train_data <- train_data[, setdiff(names(train_data), remove_tcols)]
+test_data  <- test_data[, setdiff(names(test_data), remove_tcols)]
+
+# Impute evaluation attributes with median metrics calculated strictly on training observations
+for (col in score_cols) {
+  train_median <- median(train_data[[col]], na.rm = TRUE)
+  
+  train_data[[col]][is.na(train_data[[col]])] <- train_median
+  test_data[[col]][is.na(test_data[[col]])] <- train_median
+}
+
+head(train_data)
+head(train_data$bathrooms_text)
+
+
+
+
+```
+
+```{r}
+
+head(train_data)
+head(train_data$bathrooms_text)
+```
+
+
+
+```{r}
+
+sum(train_data$host_is_superhost)/length(train_data$host_is_superhost)
+
+```
+### majority class is 0
+### Thus we shall impute by mode
+```{r}
+
+sum(train_data$host_is_superhost) / length(train_data$host_is_superhost)
+
+# Impute categorical superhost attributes using the dominant baseline majority mode (0)
+train_data$host_is_superhost[is.na(train_data$host_is_superhost)] <- 0
+test_data$host_is_superhost[is.na(test_data$host_is_superhost)]   <- 0
+
+# Scale host acceptance metrics down to standard ratio probabilities
+train_data$host_acceptance_rate <- train_data$host_acceptance_rate / 100
+test_data$host_acceptance_rate  <- test_data$host_acceptance_rate / 100
+
+# Set negative flags for tree architectures to safely isolate missing metrics natively
+train_data$host_acceptance_rate[is.na(train_data$host_acceptance_rate)] <- -1
+test_data$host_acceptance_rate[is.na(test_data$host_acceptance_rate)]   <- -1
+
+
+```
+
+
+
+
+```{r}
+
+
+# Scale host acceptance metrics down to standard ratio probabilities
+train_data$host_acceptance_rate <- train_data$host_acceptance_rate / 100
+test_data$host_acceptance_rate  <- test_data$host_acceptance_rate / 100
+
+# Set negative flags for tree architectures to safely isolate missing metrics natively
+train_data$host_acceptance_rate[is.na(train_data$host_acceptance_rate)] <- -1
+test_data$host_acceptance_rate[is.na(test_data$host_acceptance_rate)]   <- -1
+
+```
+
+
+## one-hot encoding room_type column
+```{r}
+
+# Compute contrast dummy rules dropping primary reference fields (FullRank = TRUE)
+encoder_rules <- dummyVars(formula = ~ room_type, data = train_data, fullRank = TRUE)
+
+train_encoded <- as.data.frame(predict(encoder_rules, newdata = train_data))
+test_encoded  <- as.data.frame(predict(encoder_rules, newdata = test_data))
+
+train_data <- cbind(train_data, train_encoded)
+test_data  <- cbind(test_data, test_encoded)
+
+train_data$room_type <- NULL
+test_data$room_type  <- NULL
+
+# Re-run full-rank contrast definitions across regional geographical attributes
+city_encoder <- dummyVars(formula = ~ City, data = train_data, fullRank = TRUE)
+
+train_city_encoded <- as.data.frame(predict(city_encoder, newdata = train_data))
+test_city_encoded  <- as.data.frame(predict(city_encoder, newdata = test_data))
+
+train_data <- cbind(train_data, train_city_encoded)
+test_data  <- cbind(test_data, test_city_encoded)
+
+train_data$City <- NULL
+test_data$City  <- NULL
+
+
+```
+
+
+## One-hot encoding on the amenities column. 
+```{r}
+
+library(stringr)
+
+target_amenities <- c(
+  "smoke alarm", "toaster", "mini fridge", "hot water", 
+  "dishwasher", "Air conditioning", "Kitchen", "wifi", " Refrigerator", "Hot water", "Microwave "
+)
+
+engineer_amenities <- function(df) {
+  df$amenities_clean <- tolower(df$amenities)
+  df$amenities_clean <- str_replace_all(df$amenities_clean, pattern = c("\\[" = "", "\\]" = "", "\\\\" = "", "\"" = ""))
+  
+  for (amenity in target_amenities) {
+    col_name <- paste0("has_", gsub(" ", "_", amenity))
+    df[[col_name]] <- ifelse(str_detect(df$amenities_clean, fixed(amenity)), 1, 0)
+  }
+  
+  df$amenities       <- NULL
+  df$amenities_clean <- NULL
+  return(df)
+}
+
+train_data <- engineer_amenities(train_data)
+test_data  <- engineer_amenities(test_data)
+
+```
+
+
+
+
+
+```{r}
+
+# Process categorical continuous communication channels
+encode_response_time <- function(column) {
+  char_col <- trimws(as.character(column))
+  encoded  <- rep(0, length(char_col))
+  
+  encoded[char_col == "within an hour"]        <- 4
+  encoded[char_col == "within a few hours"]    <- 3
+  encoded[char_col == "within a day"]          <- 2
+  encoded[char_col == "a few days or more"]    <- 1
+  
+  encoded[char_col %in% c("N/A", "unknown", "blank", "")] <- 0
+  encoded[is.na(char_col)]                                 <- 0 
+  return(as.integer(encoded))
+}
+
+train_data$host_response_time_num <- encode_response_time(train_data$host_response_time)
+test_data$host_response_time_num  <- encode_response_time(test_data$host_response_time)
+
+train_data$host_response_time <- NULL
+test_data$host_response_time  <- NULL
+
+
+
+```
+
+
+### The bathroom_text must be converted to numeric
+```{r}
+
+library(dplyr)
+library(readr)
+
+num_bathrooms <- function(df) {
+  df %>%
+    mutate(
+      bath_temp = tolower(trimws(bathrooms_text)),
+      bath_temp = case_when(
+        grepl("half-bath", bath_temp) ~ "0.5",
+        bath_temp == "shared baths"   ~ "0",
+        TRUE                          ~ bath_temp
+      ),
+      bathrooms_numeric = parse_number(bath_temp)
+    ) %>%
+    select(-bath_temp, -bathrooms_text)
+}
+
+train_cleaned <- num_bathrooms(train_data)
+test_cleaned  <- num_bathrooms(test_data)
+
+
+```
+
+
+
+```{r}
+
+# Evacuate standard incomplete rows
+train_cleaned <- na.omit(train_cleaned)
+test_cleaned  <- na.omit(test_cleaned) 
+
+# Convert the pricing distributions to log scales
+train_cleaned$logprice <- log(train_cleaned$price)
+test_cleaned$logprice  <- log(test_cleaned$price)
+
+# Compute absolute IQR metrics using the training baseline subset
+iqr <- IQR(train_cleaned$logprice)
+Q   <- quantile(train_cleaned$logprice, probs = c(.25, .75), na.rm = FALSE)
+U   <- Q[2] + 1.5 * iqr
+D   <- Q[1] - 1.5 * iqr
+
+# Using log scale to trim the data.
+train_data1 <- subset(train_cleaned, logprice > D & logprice < 8)
+test_data1  <- subset(test_cleaned, logprice > D & logprice < 8)
+
+#head(train_data1)
+
+
+
+```
+
+
+
+```{r}
+
+
+
+pdf("distribution_raw_price.pdf", width = 6, height = 5)
+hist(train_cleaned$price, 
+     main = "Distribution of Raw Airbnb Prices", 
+     xlab = "Price ($)", 
+     col = "lightblue", 
+     border = "white")
+dev.off()
+
+
+pdf("distribution_filtered_log_price.pdf", width = 6, height = 5)
+hist(train_data1$logprice, 
+     main = "Distribution of Filtered Log Prices", 
+     xlab = "Log(Price)", 
+     col = "lightgreen", 
+     border = "white")
+dev.off()
+
+
+pdf("distribution_filtered_raw_price.pdf", width = 6, height = 5)
+hist(train_data1$price, 
+     main = "Distribution of Filtered Raw Prices", 
+     xlab = "Price ($)", 
+     col = "coral", 
+     border = "white")
+dev.off()
+
+
+qqnorm(train_data1$logprice, main = "Q-Q Plot: Baseline RF Residuals", col = rgb(0,0,1, alpha=0.15), pch=19)
+qqline(train_data1$logprice, col = "red", lwd = 2)
+
+
+```
+
+### Random forest model will be fitted thus, first the non-numeric variables are removed
+### Then, longitude and latitude, for proper application of the hybrid method.
+
+
+```{r}
+
+train_final <- train_data1 %>%
+   select(-id, -neighbourhood_cleansed, -property_type,
+          -latitude, -longitude,-host_city, -logprice)
+
+test_final <- test_data1 %>%
+   select(-id, -neighbourhood_cleansed, -property_type,
+          -latitude, -longitude,-host_city, -logprice)
+
+```
+
+
+## 1. Grid search on the ranger fit random forest.
+
+
+```{r}
+
+library(ranger)
+
+
+set.seed(1852) 
+sub_sample_size <- min(5000, nrow(train_final))
+
+
+train_sub <- train_final[sample(1:nrow(train_final), sub_sample_size),]
+
+# Define a light grid
+hyper_grid <- expand.grid(
+  mtry          = c(2, 4, 8, 22), 
+  min.node.size = c(5, 10, 20),
+  oob_rmse      = 0            
+)
+
+
+for(i in 1:nrow(hyper_grid)) {
+  
+  model <- ranger(
+    dependent.variable.name = "price", 
+    data            = train_sub, 
+    num.trees       = 150,               
+    mtry            = hyper_grid$mtry[i],
+    min.node.size   = hyper_grid$min.node.size[i],
+    max.depth       = 12,                
+    save.memory     = TRUE,              
+    num.threads     = 2,                 
+    seed            = 1893
+  )
+  
+  hyper_grid$oob_rmse[i] <- sqrt(model$prediction.error)
+  
+  rm(model)
+  gc() 
+}
+
+print(hyper_grid)
+
+
+
+```
+
+
+## Chosen RF model from the above grid search has mtry of 8 and min.node.size of 5, this is to avoid overfitting
+
+```{r}
+
+
+
+set.seed(1852)
+
+rf1 <- ranger(
+  dependent.variable.name = "price",     
+  data                    = train_final, 
+  num.trees               = 100,            
+  importance              = "permutation",
+  mtry                    = 8,
+  min.node.size           = 5,
+  save.memory             = TRUE          
+)
+
+print(rf1)
+
+
+
+```
+
+## Drop useless variables that scored 0 or negative in your importance test
+```{r}
+
+rf_importance <- importance(rf1)
+importance_df <- data.frame(
+  Feature    = names(rf_importance),
+  Importance = as.numeric(rf_importance)
+)
+
+
+
+# Sort features descending by predictive value
+importance_df   <- importance_df[order(-importance_df$Importance), ]
+sorted_features <- importance_df$Feature
+
+
+
+importance_threshold <- 1000
+
+# Automatically identify features below or equal to the threshold
+useless_features_auto <- importance_df$Feature[importance_df$Importance <= importance_threshold]
+
+# Print out the automatically caught features for transparency
+cat("--- Automatically Dropping", length(useless_features_auto), "Useless Features ---\n")
+print(useless_features_auto)
+
+
+
+keep_features <- setdiff(names(train_final), useless_features_auto)
+
+train_final <- train_final[, keep_features]
+test_final  <- test_final[, keep_features]
+
+
+# Verification Check
+cat("\nRemaining column count in training set:", ncol(train_final), "\n")
+head(train_final)
+
+```
+
+
+
+```{r}
+rf2 <- ranger(
+  dependent.variable.name = "price",     
+  data                    = train_final, 
+  num.trees               = 100,            
+  importance              = "permutation",
+  mtry                    = 8,
+  min.node.size           = 5,
+  save.memory             = TRUE          
+)
+
+print(rf2)
+
+
+ importance(rf2)
+
+
+```
+
+
+
+## 1. Predictions & residuals for the training and test sets.
+```{r}
+
+
+
+train_data1$y_pred <- predict(rf2, data = train_final)$predictions
+train_data1$rf_residuals <- train_data1$price - train_data1$y_pred
+
+
+
+
+
+
+
+
+```
+
+
+
+### Residual check for normality
+
+```{r}
+
+pdf("RF_Residual_Normality_Diagnostics.pdf", width = 10, height = 8)
+
+# Set up a 2x2 grid framework for side-by-side visual analysis
+par(mfrow = c(1, 2))
+
+
+# Extract baseline training residuals (used as the input for Kriging)
+rf_res <- train_data1$rf_residuals
+
+# Plot 1: Histogram of Baseline RF Residuals
+hist(rf_res, col = "skyblue",xlim=c(-700, 700), main = "Histogram: Baseline RF Residuals",
+     xlab = "Residual Error ($)", border = "white")
+abline(v = mean(rf_res, na.rm=TRUE), col = "red", lwd = 2, lty = 2)
+
+# Plot 2: Normal Q-Q Plot of Baseline RF Residuals
+qqnorm(rf_res, main = "Q-Q Plot: Baseline RF Residuals", col = rgb(0,0,1, alpha=0.15), pch=19)
+qqline(rf_res, col = "red", lwd = 2)
+
+
+# Reset plotting layout parameters
+par(mfrow = c(1, 1))
+dev.off()
+
+
+
+
+
+
+```
+
+
+
+
+## 2. Spatial conversion
+
+```{r}
+
+library(sf)       
+library(gstat)    
+library(ggplot2)  
+
+# Convert flat data to spatial coordinates using standard WGS84
+spatial_train_geo <- st_as_sf(train_data1, coords = c("longitude", "latitude"), crs = 4326)
+spatial_test_geo  <- st_as_sf(test_data1, coords = c("longitude", "latitude"), crs = 4326)
+
+# NAD83: 3310 ( crs for California) covers the whole state 
+spatial_train_projected <- st_transform(spatial_train_geo, crs = 3310)
+spatial_test_projected  <- st_transform(spatial_test_geo, crs = 3310)
+
+# Jitter coordinate duplicates to avoid spatial distance errors (0-meter distance bugs)
+spatial_train <- st_jitter(spatial_train_projected, amount = 1.0)
+spatial_test  <- st_jitter(spatial_test_projected, amount = 1.0)
+
+
+# Check training residuals
+any(is.na(spatial_train$rf_residuals))
+
+# Missing value check
+any(is.na(spatial_test$price))
+any(is.na(spatial_test$rf_residuals))
+
+
+```
+
+## 1. VARIOGRAM computation and stable fitting of the kriging model on residuals 
+
+```{r}
+
+sub_sample_size <- min(5000, nrow(spatial_train))
+spatial_train_sub <- spatial_train[sample(1:nrow(spatial_train), sub_sample_size), ]
+
+# Compute empirical variogram
+emp_vgm <- variogram(rf_residuals ~ 1, data = spatial_train_sub)
+
+# Find total sample variance
+init_variance <- var(spatial_train_sub$rf_residuals, na.rm = TRUE)
+
+# Distributed variance stably between psill (70%) and nugget (30%) 
+
+init_vgm <- vgm(
+  psill  = init_variance * 0.7, 
+  model  = "Sph", 
+  range  = 5000, 
+  nugget = init_variance * 0.3
+)
+
+# automated curve fitting
+fitted_vgm <- fit.variogram(emp_vgm, model = init_vgm)
+
+
+print(fitted_vgm)
+
+
+# 2.Variogram plot
+pdf("RF_residual.pdf", width = 6, height = 5 )
+plot(
+  emp_vgm, 
+  model = fitted_vgm, 
+  main  = list(label = "Fitted Semivariogram Model of Price RF Residuals", cex = 1.2),
+  xlab  = "Distance (metres)", 
+  ylab  = "Semivariance"
+)
+dev.off()
+
+```
+
+
+## 5.Test set prediction ( Local Search Neighborhood used)
+
+```{r}
+
+
+
+test_rf_pred <- predict(rf2, data = test_final)$predictions
+
+# Store the baseline prediction
+test_data1$rf_pred <- test_rf_pred
+
+# Verification checks
+any(is.na(test_rf_pred))
+summary(test_rf_pred)
+
+
+# nmax = 50 keeps the matrix processing light
+test_res_kriged <- krige(
+  formula   = rf_residuals ~ 1, 
+  locations = spatial_train, 
+  newdata   = spatial_test, 
+  model     = fitted_vgm,
+  nmax      = 50
+)
+
+
+# Extracting the interpolated residuals
+kriged_residual_values <- test_res_kriged$var1.pred
+
+# set spatial correction to 0 for unkriged points
+kriged_residual_values[is.na(kriged_residual_values)] <- 0
+
+# Combined predictions
+spatial_test$final_kriged_pred <- test_rf_pred + kriged_residual_values
+
+
+
+# Checks for data gaps 
+
+cat("Number of skipped test points remaining:", sum(is.na(spatial_test$final_kriged_pred)), "\n")
+
+any(is.na(test_res_kriged$var1.pred))
+
+head(test_res_kriged)
+
+
+```
+
+
+## Final RF and Kriging pred
+
+```{r}
+
+
+
+kriged_values <- as.numeric(test_res_kriged$var1.pred)
+
+# If any point was out of range and skipped, treat correction as 0
+kriged_values[is.na(kriged_values)] <- 0
+
+# Combining  RF with the spatial correction
+final_test_predictions <- test_rf_pred + kriged_values
+
+
+test_data1$final_kriged_pred <- final_test_predictions
+spatial_test$final_kriged_pred <- final_test_predictions
+
+test.res <- final_test_predictions- test_data1$price
+
+
+# 2. Model evaluations
+
+### RF training Predictions
+eval_RF <- data.frame(
+  obs  = test_data1$price, 
+  pred = test_data1$rf_pred
+)
+
+cat("--- Random Forest Evaluation Top Rows ---\n")
+print(head(eval_RF))
+
+
+### Combined RF+Kriging Predictions
+eval_test <- data.frame(
+  obs  = test_data1$price, 
+  pred = test_data1$final_kriged_pred
+)
+
+cat("\n--- Combined RF + Kriging Evaluation Top Rows ---\n")
+print(head(eval_test))
+
+
+```
+
+
+
+
+```{r}
+# 1.coordinates matrix from the spatial dataset
+coords_test <- st_coordinates(spatial_test)
+
+
+spatial_test$Easting  <- coords_test[, 1]
+spatial_test$Northing <- coords_test[, 2]
+
+# 3.Pricing Heatmap
+pdf("Pricing_Heatmap.pdf", width = 6, height = 5 )
+ggplot(data = spatial_test) +
+  stat_summary_hex(
+    aes(x = Easting, y = Northing, z = final_kriged_pred),
+    fun = function(x) mean(x, na.rm = TRUE),
+    bins = 40
+  ) +
+  scale_fill_viridis_c(option = "plasma", name = "Avg Price ($)") +
+  theme_minimal() +
+  labs(
+    title = "Spatial Heatmap: Predicted Airbnb Prices (RF+K)",
+    subtitle = "Aggregated Regional Price Trends (California)",
+    x = "Easting (metres)", 
+    y = "Northing (metres)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "right"
+  )
+
+dev.off()
+
+
+```
+
+
+```{r}
+
+pdf("RFK_error.pdf", width=6, height=5)
+ggplot(data = spatial_test) +
+  geom_sf(aes(color = test.res), size = 1.2, alpha = 0.7) +
+  # Diverging scale: Red means underpriced, Blue means overpriced, Green is good.
+  scale_color_gradient2(
+    low = "blue", mid = "green", high = "red", 
+    midpoint = 0, name = "Prediction Error ($)"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Spatial Error Analysis: Where is the (RF+K) Model Wrong?",
+    subtitle = "Red = Predicted Too Low | Blue = Predicted Too High",
+    x = "Easting (metres)", y = "Northing (metres)"
+  ) +
+  theme(plot.title = element_text(face = "bold", size = 14))
+dev.off()
+
+```
+
+
+```{r}
+
+# Thematic Point Map
+pdf("Thematic_Point_Map_RF_pred.pdf", width = 6, height = 5 )
+ggplot(data = spatial_train) +
+  geom_sf(aes(color = y_pred), size = 2, alpha = 0.8) +
+  scale_color_viridis_c(option = "turbo", name = "RF Prediction") +
+  labs(
+    title = "Spatial Random Forest Predictions",
+    subtitle = "Mapped directly from coordinate points"
+  ) +
+  theme_minimal()
+
+dev.off()
+
+```
+
+# More evaluations
+
+
+```{r}
+
+evaluate <- function(pred, obs, model_title = "Actual vs Predicted") {
+  
+  # FIXED: Explicitly use base::mean to bypass the environment variable conflict (Aid with previous issue)
+  mse <- base::mean((pred - obs)^2)
+  rmse <- sqrt(mse)
+  mae <- base::mean(abs(pred - obs))
+  r_squared <- 1 - (sum((obs - pred)^2) / sum((obs - base::mean(obs))^2))
+  
+  plot(
+    obs, pred, 
+    main = model_title,
+    xlab = "Actual Price ($)", 
+    ylab = "Predicted Price ($)", 
+    col  = rgb(0, 0, 1, alpha = 0.2),
+    pch  = 19,
+    cex  = 0.6
+  )
+  
+ 
+  abline(0, 1, col = "red", lwd = 2)
+  
+ 
+  cat("---", model_title, "Metrics ---\n")
+  cat("MSE:       ", round(mse, 2), "\n")
+  cat("RMSE:      ", round(rmse, 2), "\n")
+  cat("MAE:       ", round(mae, 2), "\n")
+  cat("R-squared: ", round(r_squared, 4), "\n\n")
+}
+
+
+
+```
+
+
+
+```{r}
+
+# 1. Evaluate the baseline Random Forest
+pdf("prediction_map1.pdf",width = 6, height = 5 )
+evaluate(test_data1$rf_pred, test_data1$price, "Baseline Random Forest")
+dev.off()
+
+
+# 2. Evaluate the Combined RF + Kriging model
+pdf("prediction_map2.pdf",width = 6, height = 5 )
+evaluate(test_data1$final_kriged_pred, test_data1$price, "Combined RF + Kriging")
+dev.off()
+
+```
+
+
+
+
+
+
+
+
+
+```{r}
+# predictions on the training data from the final rf2 model
+train_rf_pred <- predict(rf2, data = train_final)$predictions
+
+
+train_data1$rf_pred <- train_rf_pred
+
+evaluate(train_data1$rf_pred, train_data1$price, "Training Set: Baseline Random Forest")
+
+
+
+```
+
+
+### The pure random forest model
+
+
+
+### Random forest model will be fitted thus, first the non-numeric variables are removed
+### longitude and latitude included this time.
+
+```{r}
+
+train_final1<- train_data1 %>%
+   select(-id, -neighbourhood_cleansed, -property_type,
+          -host_city, -logprice)
+test_final1 <- test_data1 %>%
+   select(-id, -neighbourhood_cleansed, -property_type,
+          -host_city, -logprice)
+
+```
+
+## Removal of past predictions.
+```{r}
+
+tracking_cols <- c("y_pred", "rf_residuals", "rf_pred", "final_kriged_pred")
+
+# clean training and testing subsets that keep coordinates but drop tracking columns
+pure_rf_train <- train_final1[, setdiff(names(train_final1), tracking_cols)]
+pure_rf_test  <- test_final1[, setdiff(names(test_final1), tracking_cols)]
+
+head(pure_rf_train)
+
+```
+
+
+
+
+```{r}
+
+
+keep_features <- setdiff(names(pure_rf_train), useless_features_auto)
+
+
+
+pure_rf_train  <- pure_rf_train[, keep_features]
+pure_rf_test   <- pure_rf_test[, keep_features]
+
+
+
+
+## Column check
+cat("\nRemaining column count in training set:", ncol(pure_rf_train ), "\n")
+head(pure_rf_train )
+
+
+```
+
+
+
+```{r}
+#head(pure_rf_train)
+
+```
+
+
+
+```{r}
+
+
+
+set.seed(1852)
+
+pure_rf_model <- ranger(
+  dependent.variable.name = "price",
+  data                    = pure_rf_train,
+  num.trees               = 100,            
+  importance              = "permutation",
+  mtry                    = 8,      
+  min.node.size           = 5,           
+  save.memory             = TRUE     
+)
+
+print(pure_rf_model)
+
+
+pure_rf_preds <- predict(pure_rf_model, data = pure_rf_test)$predictions
+
+
+evaluate(pure_rf_preds, pure_rf_test$price, "Pure Random Forest (With Coordinates)")
+
+
+```
+
+```{r}
+
+pure_rf_train_preds <- predict(pure_rf_model, data = pure_rf_train[setdiff(names(pure_rf_train), "price") ])$predictions
+
+
+pure_rf_test_pred <- predict(pure_rf_model, data= pure_rf_test[setdiff(names(pure_rf_test), "price") ])$predictions
+
+
+
+rf_error <- pure_rf_test_pred - pure_rf_test$price
+
+evaluate(pure_rf_train_preds, pure_rf_train$price, "Training Set: Pure Random Forest")
+
+pdf("pure_rf_pred_map.pdf", width = 6, height = 5)
+evaluate(pure_rf_test_pred, pure_rf_test$price, "Test set: Pure Random Forest")
+dev.off()
+```
+
+
+
+
+
+
+
+
+
+```{r}
+pdf("Pure_RF_heat_map", width=6, height=5)
+#coords_test <- st_coordinates(spatial_test)
+
+# coordinates added back as simple columns
+#spatial_test$Easting  <- coords_test[, 1]
+#spatial_test$Northing <- coords_test[, 2]
+
+ggplot(data = spatial_test) +
+  stat_summary_hex(
+    aes(x = Easting, y = Northing, z = pure_rf_test_pred),
+    fun = function(x) mean(x, na.rm = TRUE),
+    bins = 40
+  ) +
+  scale_fill_viridis_c(option = "plasma", name = "Avg Price ($)") +
+  theme_minimal() +
+  labs(
+    title = " Spatial Heatmap: Predicted Pure RF Airbnb Prices",
+    subtitle = "Real-World Regional Price Distribution (California)",
+    x = "Easting (metres)", 
+    y = "Northing (metres)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "right"
+  )
+
+dev.off()
+
+pdf("Actual_price_map.pdf", width=6, height=5)
+ggplot(data = spatial_test) +
+  geom_sf(aes(color = price), size = 2, alpha = 0.8) + 
+  scale_color_viridis_c(option = "turbo", name = "Actual Price ($)") +
+  labs(
+    title = "Spatial Actual Airbnb Prices",
+    subtitle = "Mapped directly from coordinate points"
+  ) +
+  theme_minimal()
+dev.off()
+
+```
+
+
+
+```{r}
+
+pdf("RF_Error.pdf", width=6, height=5)
+ggplot(data = spatial_test) +
+  geom_sf(aes(color = rf_error), size = 1.2, alpha = 0.7) +
+  # Diverging scale: Red means underpriced, Blue means overpriced, Green is good.
+  scale_color_gradient2(
+    low = "blue", mid = "green", high = "red", 
+    midpoint = 0, name = "Prediction Error ($)"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Spatial Error Analysis: Where is the (RF) Model Wrong?",
+    subtitle = "Red = Predicted Too Low | Blue = Predicted Too High",
+    x = "Easting (metres)", y = "Northing (metres)"
+  ) +
+  theme(plot.title = element_text(face = "bold", size = 14))
+dev.off()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### Neural Network and Hybrid framework
+
+
+```{r}
+
+library(neuralnet)
+library(nnet)
+library(caret)
+library(janitor)
+library(glmnet)
+library(sf)
+library(gstat)
+library(ggplot2)
+library(dplyr)
+library(scales)
+
+
+head(train_data1)
+
+
+
+
+## Unneeded variables
+train_nn <- train_data1 %>%
+   select(-id, -neighbourhood_cleansed, -property_type, -host_city, -logprice)
+test_nn  <- test_data1 %>%
+   select(-id, -neighbourhood_cleansed, -property_type, -host_city, -logprice)
+
+
+```
+
+
+
+
+```{r}
+
+tracking_cols <- c("y_pred", "rf_residuals", "rf_pred", "final_kriged_pred", 
+                   "bathrooms_numeric", "has_Microwave_", "has_Hot_water", 
+                   "has__Refrigerator", "has_Kitchen", "has_Air_conditioning", 
+                   "has_mini_fridge", "has_toaster", "is_new_listing", "has_dishwasher")
+
+ts_train1 <- train_nn[, setdiff(names(train_nn), tracking_cols)]
+ts_test1  <- test_nn[, setdiff(names(test_nn), tracking_cols)]
+
+# Range transformation normalisation preprocessing
+preprocess_params <- preProcess(ts_train1, method = c("range"))
+scaled_train <- predict(preprocess_params, ts_train1)
+scaled_test <- predict(preprocess_params, ts_test1)
+
+## Cleaning the column names
+scaled_train <- clean_names(scaled_train)
+scaled_test  <- clean_names(scaled_test)
+ 
+
+```
+
+
+## Feature selection and model selection
+
+### Lasso Regression ( importance filter)
+
+#### This is to select the variable subset for later
+
+```{r}
+
+numeric_features <- scaled_train[, sapply(scaled_train, is.numeric)]
+numeric_features$price <- NULL
+
+corr_matrix       <- cor(numeric_features, use = "pairwise.complete.obs")
+highly_correlated <- findCorrelation(corr_matrix, cutoff = 0.85, names = TRUE)
+train_filtered    <- scaled_train[, !names(scaled_train) %in% highly_correlated]
+
+# Run Cross-Validated Lasso importance analysis
+x_matrix <- model.matrix(price ~ ., data = train_filtered)[, -1]
+y_vector <- train_filtered$price
+cv_lasso <- cv.glmnet(x_matrix, y_vector, alpha = 1)
+
+coef_matrix <- as.matrix(coef(cv_lasso, s = "lambda.min"))
+coef_df     <- data.frame(Feature = rownames(coef_matrix), Importance = abs(coef_matrix[, 1]))
+coef_df     <- coef_df[coef_df$Feature != "(Intercept)", ]
+
+
+
+
+
+```
+
+```{r}
+
+set.seed(1852)
+train_sample <- scaled_train[sample(1:nrow(scaled_train), 5000), ]
+
+
+
+```
+
+
+
+```{r}
+
+
+set.seed(1852)
+sorted_features   <- coef_df[order(-coef_df$Importance), "Feature"]
+feature_counts    <- c(5, 10, 15, 20, 25, 30, 40)
+validation_errors <- numeric(length(feature_counts))
+
+for (i in seq_along(feature_counts)) {
+  k                <- feature_counts[i]
+  current_features <- sorted_features[1:k]
+  temp_formula     <- as.formula(paste("price ~", paste(current_features, collapse = " + ")))
+  hidden_neurons   <- max(3, round(k / 2))
+  
+  suppressWarnings({
+    temp_model <- neuralnet(
+      temp_formula, data = train_sample, hidden = c(hidden_neurons),
+      linear.output = TRUE, stepmax = 5e5, threshold = 0.1
+    )
+    test_feats         <- scaled_test[, current_features, drop = FALSE]
+    preds              <- as.vector(compute(temp_model, test_feats)$net.result)
+    validation_errors[i] <- mean(abs(preds - scaled_test$price))
+  })
+}
+
+performance_df <- data.frame(Features = feature_counts, MAE = validation_errors)
+plot(performance_df$Features, performance_df$MAE, type = "b", col = "blue", pch = 16, lwd = 2,
+     xlab = "Number of Top Features Used", ylab = "Prediction Error (Scaled MAE)", main = "Finding the Optimal Number of Features")
+
+
+
+```
+## 20 variables will be enough
+
+```{r}
+# Capture top 20 features for tuning criteria
+top_20_features <- coef_df[order(-coef_df$Importance), ][1:20, "Feature"]
+print("Top 20 Features for the Neural Network are:")
+print(top_20_features)
+
+```
+
+
+```{r}
+
+
+
+
+
+set.seed(1852)
+train_sample <- scaled_train[sample(1:nrow(scaled_train), 5000), ]
+
+
+formula_20   <- as.formula(paste("price ~", paste(top_20_features, collapse = " + ")))
+fast_control <- trainControl(method = "cv", number = 3)
+
+
+
+
+grid_20 <- expand.grid(layer1 = c(3, 5), layer2 = c(0, 3), layer3 = c(0))
+
+nn_tuned <- train(
+  formula_20, data = train_sample, method = "neuralnet", 
+  trControl = fast_control, tuneGrid = grid_20, 
+  linear.output = TRUE, stepmax = 1e6, threshold = 0.1
+) 
+
+print(nn_tuned$bestTune)
+plot(nn_tuned)
+
+
+
+```
+
+
+
+### 3 neuron in layer 1 and 3 in layer 2
+
+
+
+
+```{r}
+
+set.seed(1852)
+scaled_train_small <- scaled_train[sample(1:nrow(scaled_train), 5000), ]
+feature_names <- top_20_features
+nn_formula <- as.formula(paste("price ~", paste(feature_names , collapse = " + ")))
+
+n <- neuralnet(
+  formula = nn_formula, data = scaled_train_small, hidden = c(3, 3),                
+  linear.output = TRUE, threshold = 0.2, stepmax = 10000, lifesign = "minimal" 
+)
+plot(n)
+
+
+
+
+scaled_t  <- scaled_test %>% select(all_of(top_20_features), price)
+
+
+
+
+
+scaled_predictions <- compute(n, scaled_t[, setdiff(names(scaled_t), "price")])$net.result
+
+min_price <- min(ts_train1$price, na.rm = TRUE)
+max_price <- max(ts_train1$price, na.rm = TRUE)
+
+actual_predictions <- scaled_predictions*(max_price - min_price) + min_price
+
+actual_test_prices <- ts_test1$price
+ts_test1$n_pred    <- actual_predictions
+
+# Calculate Evaluation Metrics
+error <- actual_test_prices - actual_predictions
+
+
+mae <- mean(abs(error))
+
+rmse <- sqrt(mean(error^2))
+
+# R-squared calculation
+ss_res <- sum(error^2)
+ss_tot <- sum((actual_test_prices - mean(actual_test_prices))^2)
+r_squared <- 1 - (ss_res / ss_tot)
+
+# Print performance scorecard
+cat("--- NEURAL NETWORK PERFORMANCE RECORD ---\n",
+    "Mean Absolute Error (MAE):     $", round(mae, 2), "\n",
+    "Root Mean Squared Error (RMSE): $", round(rmse, 2), "\n",
+    "R-squared Score (R²):           ", round(r_squared, 4), "\n",
+    "-----------------------------------------\n")
+
+
+results_df <- data.frame(Actual = actual_test_prices, Predicted = as.vector(actual_predictions))
+
+pdf("NN_Test_pred.pdf", width=6, height=5)
+plot(results_df$Actual, results_df$Predicted, xlab = "Actual Prices ($)", ylab = "Predicted Prices ($)",
+     main = "Testset Neural Network Regression : Predicted vs Actual ", col = alpha("blue", 0.5), pch = 16)
+abline(a = 0, b = 1, col = "red", lwd = 2, lty = 2)
+dev.off
+```
+
+```{r}
+
+pdf("NN_Error.pdf", width=6, height=5)
+ggplot(data = spatial_test) +
+  geom_sf(aes(color = error), size = 1.2, alpha = 0.7) +
+  # Diverging scale: Red means underpriced, Blue means overpriced, Green is good.
+  scale_color_gradient2(
+    low = "blue", mid = "green", high = "red", 
+    midpoint = 0, name = "Prediction Error ($)"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Spatial Error Analysis: Where is the (NN) Model Wrong?",
+    subtitle = "Red = Predicted Too Low | Blue = Predicted Too High",
+    x = "Easting (metres)", y = "Northing (metres)"
+  ) +
+  theme(plot.title = element_text(face = "bold", size = 14))
+dev.off()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+## NN + Kriging
+
+```{r}
+
+scaled_train1 <- scaled_train %>% select(all_of(top_20_features), -latitude, price)
+scaled_test1  <- scaled_test %>% select(all_of(top_20_features), -latitude, price)
+
+scaled_train1_small <- scaled_train1[sample(1:nrow(scaled_train1), 5000), ]
+
+set.seed(1852)
+feature_names <- setdiff(names(scaled_train1), "price")
+nn_formula <- as.formula(paste("price ~", paste(feature_names, collapse = " + ")))
+
+n1 <- neuralnet(
+  formula = nn_formula, data = scaled_train1_small, hidden = c(3, 3),                 
+  linear.output = TRUE, threshold = 0.2, stepmax = 10000
+)
+plot(n1)
+
+
+
+
+```
+
+
+
+
+
+
+```{r}
+
+scaled_predictions1 <- compute(n1, scaled_train1[, setdiff(names(scaled_train1), "price")])$net.result
+
+
+actual_predictions1 <- scaled_predictions1 * (max_price - min_price) + min_price
+actual_train_prices <- ts_train1$price
+
+error_train <- actual_train_prices - as.vector(actual_predictions1)
+mae_tr  <- mean(abs(error_train))
+rmse_tr <- sqrt(mean(error_train^2))
+r_squared_tr <- 1 - (sum(error_train^2) / sum((actual_train_prices - mean(actual_train_prices))^2))
+
+cat("--- NEURAL NETWORK TRAINING RESIDUAL PERFORMANCE RECORD ---\n",
+    "Mean Absolute Error (MAE):     $", round(mae_tr, 2), "\n",
+    "Root Mean Squared Error (RMSE): $", round(rmse_tr, 2), "\n",
+    "R-squared Score (R²):           ", round(r_squared_tr, 4), "\n")
+
+scaled_train$y_pred <- as.vector(actual_predictions1)
+scaled_train$n_residuals <- error_train
+
+
+
+
+```
+
+
+
+### Residual check for normality
+
+```{r}
+
+pdf("NN_Residual_Normality_Diagnostics.pdf", width = 10, height = 8)
+
+# Set up a 2x2 grid framework for side-by-side visual analysis
+par(mfrow = c(1, 2))
+
+nn_res <- scaled_train$n_residuals
+
+# Plot 1: Histogram of Baseline RF Residuals
+hist(nn_res, col = "skyblue", main = "Histogram: Baseline RF Residuals",
+     xlab = "Residual Error ($)", border = "white")
+abline(v = mean(nn_res, na.rm=TRUE), col = "red", lwd = 2, lty = 2)
+
+# Plot 2: Normal Q-Q Plot of Baseline RF Residuals
+qqnorm(nn_res, main = "Q-Q Plot: Baseline RF Residuals", col = rgb(0,0,1, alpha=0.15), pch=19)
+qqline(nn_res, col = "red", lwd = 2)
+
+
+
+# Reset plotting layout parameters
+par(mfrow = c(1, 1))
+dev.off()
+
+
+
+```
+
+
+
+
+
+```{r}
+
+spatial_train_geo <- st_as_sf(scaled_train, coords = c("longitude", "latitude"), crs = 4326)
+spatial_test_geo  <- st_as_sf(scaled_test, coords = c("longitude", "latitude"), crs = 4326)
+
+spatial_train_projected <- st_transform(spatial_train_geo, crs = 3310)
+spatial_test_projected  <- st_transform(spatial_test_geo, crs = 3310)
+
+spatial_train <- st_jitter(spatial_train_projected, amount = 1.0)
+spatial_test  <- st_jitter(spatial_test_projected, amount = 1.0)
+
+any(is.na(spatial_train$n_residuals))
+any(is.na(spatial_test$price))
+
+
+
+```
+
+
+
+
+```{r}
+
+
+sub_sample_size   <- min(5000, nrow(spatial_train))
+spatial_train_sub <- spatial_train[sample(1:nrow(spatial_train), sub_sample_size), ]
+
+emp_vgm <- variogram(n_residuals ~ 1, data = spatial_train_sub)
+init_variance <- var(spatial_train_sub$n_residuals, na.rm = TRUE)
+
+init_vgm <- vgm(
+  psill  = init_variance * 0.7, 
+  model  = "Sph", 
+  range  = 5000, 
+  nugget = init_variance * 0.3 
+)
+
+fitted_vgm <- fit.variogram(emp_vgm, model = init_vgm)
+print(fitted_vgm)
+
+
+pdf("NN_variogram.pdf", width = 6, height = 5)
+plot(emp_vgm, model = fitted_vgm, xlab = "Distance (metres)", ylab = "Semivariance",
+     main  = list(label = "Fitted Semivariogram Model of Price NN Residuals", cex = 1.2))
+
+dev.off()
+
+
+```
+
+
+
+
+
+
+```{r}
+
+scaled_t_predictions <- compute(n1, scaled_test1[, setdiff(names(scaled_test1), "price")])$net.result
+actual_predictions   <- scaled_t_predictions * (max_price - min_price) + min_price
+actual_test_prices   <- ts_test1$price
+
+scaled_test$n_pred <- as.vector(actual_predictions)
+
+
+test_res_kriged <- krige(
+  formula = n_residuals ~ 1, locations = spatial_train, 
+  newdata = spatial_test, model = fitted_vgm, nmax = 50
+)
+
+kriged_residual_values <- test_res_kriged$var1.pred
+kriged_residual_values[is.na(kriged_residual_values)] <- 0
+
+spatial_test$final_kriged_pred <- as.vector(actual_predictions) + kriged_residual_values
+cat("Number of skipped test points remaining:", sum(is.na(spatial_test$final_kriged_pred)), "\n")
+
+
+
+
+```
+
+
+
+
+```{r}
+
+
+kriged_values <- as.numeric(test_res_kriged$var1.pred)
+
+kriged_values[is.na(kriged_values)] <- 0
+
+final_test_predictions <- as.vector(actual_predictions) + kriged_values
+
+scaled_test$final_kriged_pred <- final_test_predictions
+
+spatial_test$final_kriged_pred <- final_test_predictions
+
+
+
+
+nk_test_res <- final_test_predictions - actual_test_prices
+
+
+
+eval_NN <- data.frame(obs = actual_train_prices, pred = scaled_train$y_pred)
+print(head(eval_NN))
+
+eval_test <- data.frame(obs = ts_test1$price, pred = scaled_test$final_kriged_pred)
+print(head(eval_test))
+
+
+
+```
+
+
+
+
+
+
+```{r}
+# 1.coordinates matrix from the spatial dataset
+coords_test <- st_coordinates(spatial_test)
+
+
+spatial_test$Easting  <- coords_test[, 1]
+spatial_test$Northing <- coords_test[, 2]
+
+# 3.Pricing Heatmap
+pdf("Pricing_Heatmap.pdf", width = 6, height = 5 )
+ggplot(data = spatial_test) +
+  stat_summary_hex(
+    aes(x = Easting, y = Northing, z = final_kriged_pred),
+    fun = function(x) mean(x, na.rm = TRUE),
+    bins = 40
+  ) +
+  scale_fill_viridis_c(option = "plasma", name = "Avg Price ($)") +
+  theme_minimal() +
+  labs(
+    title = "Spatial Heatmap: Predicted Airbnb Prices (RF+K)",
+    subtitle = "Aggregated Regional Price Trends (California)",
+    x = "Easting (metres)", 
+    y = "Northing (metres)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "right"
+  )
+
+dev.off()
+
+
+```
+
+
+
+```{r}
+
+
+#coords_test <- st_coordinates(spatial_test)
+#spatial_test$Easting  <- coords_test[, 1]
+#spatial_test$Northing <- coords_test[, 2]
+
+# 1. Export the Spatial Pricing Heatmap to PDF
+pdf("spatial_nn_heatmap.pdf", width = 7, height = 5)
+ggplot(data = spatial_test) +
+  stat_summary_hex(aes(x = Easting, y = Northing, z = final_kriged_pred), fun = function(x) mean(x, na.rm = TRUE), bins = 40) +
+  scale_fill_viridis_c(option = "plasma", name = "Avg Price ($)") +
+  theme_minimal() +
+  labs(title = "Spatial Heatmap: NN+OK Predicted Airbnb Prices", subtitle = "Aggregated Regional Price Trends (California)", x = "Easting (metres)", y = "Northing (metres)")
+dev.off()
+
+
+
+```
+
+
+
+
+```{r}
+
+
+evaluate_and_save <- function(pred, obs, model_title = "Actual vs Predicted", file_name = "diagnostic_plot.pdf") {
+  mse       <- base::mean((pred - obs)^2)
+  rmse      <- sqrt(mse)
+  mae       <- base::mean(abs(pred - obs))
+  r_squared <- 1 - (sum((obs - pred)^2) / sum((obs - base::mean(obs))^2))
+  
+  
+  
+  pdf(file_name, width = 6, height = 6)
+  
+  plot(obs, pred, main = model_title, xlab = "Actual Price ($)", ylab = "Predicted Price ($)", 
+       col = rgb(0, 0, 1, alpha = 0.2), pch = 19, cex = 0.6)
+  abline(0, 1, col = "red", lwd = 2)
+  
+
+  dev.off()
+  
+  # Print scorecard metrics to the R console
+  cat("---", model_title, "Metrics ---\n")
+  cat("MSE:       ", round(mse, 2), "\n")
+  cat("RMSE:      ", round(rmse, 2), "\n")
+  cat("MAE:       ", round(mae, 2), "\n")
+  cat("R-squared: ", round(r_squared, 4), "\n\n")
+}
+
+evaluate_and_save(scaled_test$n_pred, ts_test1$price, "Baseline NN", "diagnostic_baseline_nn.pdf")
+evaluate_and_save(scaled_test$final_kriged_pred, ts_test1$price, "Combined NN + Kriging", "diagnostic_nn_kriging.pdf")
+
+
+
+```
+
+
+
+```{r}
+
+pdf("NNK_Error.pdf", width=6, height=5)
+ggplot(data = spatial_test) +
+  geom_sf(aes(color = nk_test_res), size = 1.2, alpha = 0.7) +
+  # Diverging scale: Red means underpriced, Blue means overpriced, Green is good.
+  scale_color_gradient2(
+    low = "blue", mid = "green", high = "red", 
+    midpoint = 0, name = "Prediction Error ($)"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Spatial Error Analysis: Where is the (NN+K) Model Wrong?",
+    subtitle = "Red = Predicted Too Low | Blue = Predicted Too High",
+    x = "Easting (metres)", y = "Northing (metres)"
+  ) +
+  theme(plot.title = element_text(face = "bold", size = 14))
+dev.off()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Regression-Kriging
+
+```{r}
+
+
+library(sf)
+
+### longitude and latitude included only in kriging model.
+
+train_rk<-train_data1 %>%
+   select(-id, -neighbourhood_cleansed, -property_type,
+          -host_city, -logprice)
+test_rk <- test_data1 %>%
+   select(-id, -neighbourhood_cleansed, -property_type,
+         -host_city, -logprice)
+
+## Removal of past predictions.
+tracking_cols <- c("y_pred", "rf_residuals", "rf_pred",
+                   "final_kriged_pred", "bathrooms_numeric",
+                   "has_Microwave_", 
+                      "has_Hot_water", "has__Refrigerator",
+                      "has_Kitchen", "has_Air_conditioning",
+                       "has_mini_fridge", "has_toaster",
+                      "is_new_listing","has_toaster",
+                       "has_dishwasher")
+
+# clean training and testing subsets that keep coordinates but drop tracking columns
+rk_train <- train_rk[, setdiff(names(train_rk), tracking_cols)]
+
+rk_test  <- test_rk[, setdiff(names(test_rk), tracking_cols)]
+
+## Fixing some format issues
+
+if("_listings_count" %in% names(rk_train)) {
+  names(rk_train)[names(rk_train) == "_listings_count"] <- "listings_count"
+}
+
+if("_listings_count" %in% names(rk_test)) {
+  names(rk_test)[names(rk_test) == "_listings_count"] <- "listings_count"
+}
+
+
+
+```
+
+
+
+
+```{r}
+
+
+library(janitor)
+
+rk_train <- clean_names(rk_train)
+rk_test <- clean_names(rk_test)
+
+rk_train1 <- rk_train[, setdiff(names(rk_train), c("latitude", "longitude"))]
+rk_test1 <- rk_test[, setdiff(names(rk_test), c("latitude", "longitude"))]
+
+```
+
+
+
+```{r}
+
+
+library(glmnet)
+
+set.seed(52)
+
+sub_sample_size<- min(5000, nrow(rk_train1))
+train_sample <- rk_train1[sample(1:nrow(rk_train1), sub_sample_size), ]
+
+sum(is.na(train_sample))
+# 1. Prepare inputs (Lasso requires a matrix format)
+x_matrix <- as.matrix(train_sample[, setdiff(names(train_sample), "price")])
+y_vector <- train_sample$price
+
+# 2. Run cross-validated Lasso
+cv_lasso <- cv.glmnet(x_matrix, y_vector, alpha = 1)
+
+# 3. Extract the features with non-zero coefficients
+lasso_coefs <- coef(cv_lasso, s = "lambda.min")
+selected_features <- rownames(lasso_coefs)[as.matrix(lasso_coefs) != 0]
+selected_features <- setdiff(selected_features, "(Intercept)")
+
+print(paste("Lasso selected", length(selected_features), "features."))
+print(selected_features)
+
+
+```
+
+
+
+```{r}
+
+library(leaps)
+
+set.seed(42)
+
+# 1. Split your train_sample into a 70/30 split
+train_idx  <- sample(seq_len(nrow(train_sample)), size = 0.7 * nrow(train_sample))
+sub_train  <- train_sample[train_idx, ]
+sub_valid  <- train_sample[-train_idx, ]
+
+# 2. Bound your max features dynamically based on what Lasso found
+max_features <- min(30, length(selected_features))
+
+# 3. Fit a forward stepwise path on the sub-training block
+fit_forward <- regsubsets(
+  price ~ ., 
+  data = sub_train[, c("price", selected_features)], 
+  nvmax = max_features, 
+  method = "forward"
+)
+
+# 4. Set up an array to capture the validation errors
+validation_mae <- numeric(max_features)
+
+# 5. Calculate validation error for each feature count model
+for (i in 1:max_features) {
+  coef_vals <- coef(fit_forward, id = i)
+  
+  # Build a matrix out of the validation data
+  valid_matrix <- model.matrix(price ~ ., data = sub_valid[, c("price", selected_features)])
+  chosen_vars  <- names(coef_vals)
+  
+  # Generate predictions using matrix math
+  predictions  <- valid_matrix[, chosen_vars] %*% coef_vals
+  
+  # Calculate MAE on validation data
+  validation_mae[i] <- mean(abs(predictions - sub_valid$price))
+}
+
+# 6. Organize into a summary dataframe
+performance_df <- data.frame(
+  Features = 1:max_features,
+  MAE = validation_mae
+)
+
+
+plot(performance_df$Features, performance_df$MAE, type = "b", 
+     col = "darkorange", pch = 16, lwd = 2,
+     xlab = "Number of Features", 
+     ylab = "Validation MAE (Scaled)",
+     main = "Linear Model: Validation Performance Curve")
+
+
+
+```
+
+### 15 features will be enough
+
+
+```{r}
+
+# 1.Names of the 15 features from  best forward selection model
+best_coef_vals <- coef(fit_forward, id = min(15, max_features))
+winning_features <- names(best_coef_vals)
+
+# Remove the "(Intercept)" term so we only have the actual variable names
+winning_features <- setdiff(winning_features, "(Intercept)")
+print(winning_features)
+
+
+
+rk_train1 <- rk_train1 %>%
+  select(all_of(winning_features), price)
+rk_test1 <- rk_test1 %>%
+  select(all_of(winning_features), price)
+  
+
+
+# 1. Build the final formula
+final_lm_formula <- as.formula(paste("price ~", paste(winning_features, collapse = " + ")))
+
+# 2. Fit the linear model to ALL 100,000+ rows
+base_lmod <- lm(final_lm_formula, data = rk_train1)
+
+# 3. View the model coefficients and R-squared score
+summary(base_lmod)
+
+# Extract residuals (errors) from the training data
+rk_train$residuals <- residuals(base_lmod)
+
+# FIXED: Swapped out broken glmnet syntax matrix logic for a clean native LM prediction call
+rk_train$y_pred <- as.numeric(predict(base_lmod, newdata = rk_train1[setdiff(names(rk_train1), "price")]))
+
+
+
+```
+
+
+
+
+
+### Residual check for normality
+
+```{r}
+
+pdf("Residual_Normality_Diagnostics.RK.pdf", width = 10, height = 8)
+
+# Set up a 2x2 grid framework for side-by-side visual analysis
+par(mfrow = c(1, 2))
+
+# Extract baseline training residuals (used as the input for Kriging)
+rk_res <- rk_train$y_pred
+
+# Plot 1: Histogram of Baseline RF Residuals
+hist(rk_res, col = "skyblue", main = "Histogram: Baseline OLS Residuals",
+     xlab = "Residual Error ($)", border = "white")
+abline(v = mean(rk_res, na.rm=TRUE), col = "red", lwd = 2, lty = 2)
+
+# Plot 2: Normal Q-Q Plot of Baseline RF Residuals
+qqnorm(rk_res, main = "Q-Q Plot: Baseline RF Residuals", col = rgb(0,0,1, alpha=0.15), pch=19)
+qqline(rk_res, col = "red", lwd = 2)
+
+
+
+# Reset plotting layout parameters
+par(mfrow = c(1, 1))
+dev.off()
+
+
+
+
+
+
+```
+
+
+
+
+
+
+
+```{r}
+
+# Convert flat data to spatial coordinates using standard WGS84
+spatial_train_geo <- st_as_sf(rk_train, coords = c("longitude", "latitude"), crs = 4326)
+spatial_test_geo  <- st_as_sf(rk_test, coords = c("longitude", "latitude"), crs = 4326)
+
+# 3310 ( crs for California) covers the whole state 
+spatial_train_projected <- st_transform(spatial_train_geo, crs = 3310)
+spatial_test_projected  <- st_transform(spatial_test_geo, crs = 3310)
+
+# Jitter coordinate duplicates to avoid spatial distance errors (0-meter distance bugs)
+spatial_train <- st_jitter(spatial_train_projected, amount = 1.0)
+spatial_test  <- st_jitter(spatial_test_projected, amount = 1.0)
+
+# Check training residuals
+any(is.na(spatial_train$residuals))
+
+# Missing value check
+any(is.na(spatial_test$price))
+
+
+```
+
+
+
+
+
+```{r}
+
+sub_sample_size <- min(5000, nrow(spatial_train))
+spatial_train_sub <- spatial_train[sample(1:nrow(spatial_train), sub_sample_size), ]
+
+# Compute empirical variogram
+emp_vgm <- variogram(residuals ~ 1, data = spatial_train_sub)
+
+# Find total sample variance
+init_variance <- var(spatial_train_sub$residuals, na.rm = TRUE)
+
+# Distributed variance stably between psill (70%) and nugget (30%) 
+init_vgm <- vgm(
+  psill  = init_variance * 0.7, 
+  model  = "Sph", 
+  range  = 5000, 
+  nugget = init_variance * 0.3
+)
+
+# automated curve fitting
+fitted_vgm <- fit.variogram(emp_vgm, model = init_vgm)
+print(fitted_vgm)
+
+# 2.Variogram plot
+
+pdf("RK_Variogram.pdf", width=6, height = 5 )
+plot(
+  emp_vgm, 
+  model = fitted_vgm, 
+  main  = list(label = "Fitted Semivariogram Model of Regression Price Residuals", cex = 1.2),
+  xlab  = "Distance (metres)", 
+  ylab  = "Semivariance"
+)
+
+dev.off()
+
+
+```
+
+
+
+### LOCAL SEARCH NEIGHBOURHOOD KRIGING ON TEST SET
+```{r}
+ 
+rk_test$lm_pred <- predict(base_lmod, newdata = rk_test1[setdiff(names(rk_test1), "price") ])
+actual_predictions <- rk_test$lm_pred
+actual_test_prices <- rk_test$price
+
+# Store baseline metrics in the tracking structures
+rk_test$lmod_pred   <- actual_predictions
+spatial_test$y_pred <- actual_predictions
+
+# Verify calculation arrays
+any(is.na(actual_predictions))
+summary(actual_predictions)
+
+# Ordinary Kriging interpolation over isolated residual targets
+test_res_kriged <- krige(
+  formula   = residuals ~ 1, 
+  locations = spatial_train, 
+  newdata   = spatial_test, 
+  model     = fitted_vgm,
+  nmax      = 50
+)
+
+# Extract and clean interpolated spatial correction scalars
+kriged_residual_values <- test_res_kriged$var1.pred
+kriged_residual_values[is.na(kriged_residual_values)] <- 0
+
+# Combine baseline OLS predictions with spatial kriged adjustments
+spatial_test$final_kriged_pred <- actual_predictions + kriged_residual_values
+
+# Checks for data gaps
+cat("Number of skipped test points remaining:", sum(is.na(spatial_test$final_kriged_pred)), "\n")
+head(test_res_kriged)
+
+
+
+```
+
+
+
+
+
+```{r}
+
+
+kriged_values <- as.numeric(test_res_kriged$var1.pred)
+kriged_values[is.na(kriged_values)] <- 0
+
+final_test_predictions <- actual_predictions + kriged_values
+
+rk_test$final_kriged_pred <- final_test_predictions
+spatial_test$final_kriged_pred <- final_test_predictions
+
+# Verify training sets configurations
+eval <- data.frame(
+  obs  = rk_train$price, 
+  pred = rk_train$y_pred
+)
+
+cat("--- OLS Training Baseline Evaluation Top Rows ---\n")
+print(head(eval))
+
+# Combined Regression-Kriging tracking dataframe
+eval_test <- data.frame(
+  obs  = rk_test$price, 
+  pred = spatial_test$final_kriged_pred
+)
+
+cat("\n--- Combined Regression-Kriging Evaluation Top Rows ---\n")
+print(head(eval_test))
+
+
+
+```
+
+
+
+
+```{r}
+
+
+coords_test <- st_coordinates(spatial_test)
+spatial_test$Easting  <- coords_test[, 1]
+spatial_test$Northing <- coords_test[, 2]
+
+# Open PDF device to capture the spatial distribution plot
+pdf("spatial_regression_kriging_heatmap.pdf", width = 7, height = 5)
+ggplot(data = spatial_test) +
+  stat_summary_hex(
+    aes(x = Easting, y = Northing, z = final_kriged_pred),
+    fun = function(x) mean(x, na.rm = TRUE),
+    bins = 40
+  ) +
+  scale_fill_viridis_c(option = "plasma", name = "Avg Price ($)") +
+  theme_minimal() +
+  labs(
+    title = "Spatial Heatmap: Predicted Airbnb Prices",
+    subtitle = "Aggregated Regional Price Trends (California - Regression Kriging)",
+    x = "Easting (metres)", 
+    y = "Northing (metres)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "right"
+  )
+dev.off()
+
+
+
+```
+
+
+
+```{r}
+
+
+rk_test$spatial_error_pred <- kriged_values
+rk_test$rk_final_pred <- rk_test$lm_pred + rk_test$spatial_error_pred
+
+rk_res <- rk_test$rk_final_pred - rk_test$price
+
+
+```
+
+
+
+
+```{r}
+
+
+
+evaluate_and_save(rk_test$lmod_pred, rk_test$price, "Baseline Linear Model","diagnostic_baseline_lmod.pdf"  )
+
+
+
+
+evaluate_and_save(rk_test$final_kriged_pred, rk_test$price, "Combined Regression Kriging", "diagnostic_regression_kriging.pdf" )
+
+
+rk_rmse <- sqrt(mean((rk_test$price - rk_test$rk_final_pred)^2, na.rm = TRUE))
+print(paste("Regression Kriging Test RMSE: $", round(rk_rmse, 2)))
+
+
+
+```
+
+
+```{r}
+
+pdf("RK_Error.pdf", width=6, height=5)
+ggplot(data = spatial_test) +
+  geom_sf(aes(color = rk_res), size = 1.2, alpha = 0.7) +
+  # Diverging scale: Red means underpriced, Blue means overpriced, Green is good.
+  scale_color_gradient2(
+    low = "blue", mid = "green", high = "red", 
+    midpoint = 0, name = "Prediction Error ($)"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Spatial Error Analysis: Where is the (RK) Model Wrong?",
+    subtitle = "Red = Predicted Too Low | Blue = Predicted Too High",
+    x = "Easting (metres)", y = "Northing (metres)"
+  ) +
+  theme(plot.title = element_text(face = "bold", size = 14))
+dev.off()
+
+```
+
+
+
+
+
